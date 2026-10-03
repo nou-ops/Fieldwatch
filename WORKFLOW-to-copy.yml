@@ -1,0 +1,421 @@
+# .github/workflows/ios-unsigned-ipa.yml
+#
+# ينتج من نفس البناء الواحد أربعة ملفات (كلها في Artifacts):
+#   Fieldwatch-unsigned.ipa        بلا صلاحيات  → تثبيت عادي / AppSync / Sideloadly
+#   Fieldwatch-trollstore.ipa      بصلاحيات    → TrollStore يحفظها
+#   Fieldwatch-1.1.17-rootless.deb iphoneos-arm64 → /var/jb   (Dopamine / palera1n rootless)
+#   Fieldwatch-1.1.17-rootful.deb  iphoneos-arm   → /         (checkra1n/odysseyra1n القديمة)
+#
+# مضبوط على بنية مستودعك الحالية (مسطّحة: FieldwatchCore/ · FieldwatchApp/ · scripts/ · project.yml).
+# إن نقلت الملفات إلى مجلد ios/ استعمل: ios/docs/workflow-for-ios-layout.yml
+#
+# ملاحظة الحصة (مستودع خاص): دقائق macOS تُحسب بمضاعف ×10 ⇒ بناء واحد ≈ 50–100 دقيقة من الحصة.
+#
+name: iOS build (IPA + DEB)
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    name: Smoke (تشخيص سريع، ثوانٍ)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: بصمة الحزمة المطبَّقة (تحقق فوري من السجل)
+        run: |
+          if [ -f PAYLOAD-VERSION.txt ]; then
+            echo "══════ بصمة الحزمة ══════"
+            cat PAYLOAD-VERSION.txt
+            echo "═════════════════════════"
+          else
+            echo "⚠️⚠️ لا يوجد PAYLOAD-VERSION.txt في المستودع ⇒ الحزمة قديمة (قبل إصلاح count) ⚠️⚠️"
+            echo "    ارفع fieldwatch-payload.zip الجديدة إلى جذر هذا المستودع ثم شغّل من جديد."
+          fi
+          echo "— الـcommit الذي يُبنى الآن (إن كان قديمًا فالحزمة قديمة) —"
+          git log -1 --format='%h %ci %s' 2>/dev/null || echo "(لا .git)"
+          if [ -f FieldwatchApp/Sources/FieldwatchStore.swift ]; then
+            echo "— السطور 114-118 من SignatureCandidates.swift (يجب أن ترى: usable.filter { … }.count) —"
+            sed -n '114,118p' FieldwatchCore/Sources/FieldwatchCore/SignatureCandidates.swift 2>/dev/null || echo "(الملف غير موجود)"
+            echo "— بصمة إصلاحات طبقة التطبيق —"
+            grep -n "hits: \$0.hitCount" FieldwatchApp/Sources/FieldwatchStore.swift 2>/dev/null || echo "⚠️ FieldwatchStore.swift قديم (لا يزال فيه hitCount: الوسم الخاطئ)"
+            grep -n "struct BleRow" FieldwatchApp/Sources/BleScanner.swift 2>/dev/null || echo "⚠️ BleScanner.swift قديم (لا يزال يعرّف Sighting محليًا)"
+            grep -n "extension FieldwatchCore.Sighting: Identifiable" FieldwatchApp/Sources/FieldwatchStore.swift 2>/dev/null || echo "⚠️ ملحق Identifiable غير موجود"
+          else
+            echo "ℹ️ المصادر لم تُفكّ بعد (الحزمة مرفوعة كملف zip) — الفحص الكامل يجري في خطوة PREFLIGHT بعد تجهيز المستودع."
+          fi
+
+      - name: اختيار أحدث Xcode متاح (Swift 6+)
+        run: |
+          for x in /Applications/Xcode_18*.app /Applications/Xcode_17*.app /Applications/Xcode_16*.app /Applications/Xcode.app; do
+            if [ -d "$x" ]; then sudo xcode-select -s "$x" 2>/dev/null && echo "✓ Xcode: $x" && break; fi
+          done
+          echo "── الإصدارات ──"
+          xcodebuild -version 2>/dev/null || echo "(xcodebuild غير متاح)"
+          swift --version 2>/dev/null || echo "(swift غير متاح)"
+
+      - name: تجهيز المستودع — فكّ أي حزمة مرفوعة + تشخيص واضح
+        run: |
+          # ── تجهيز المستودع: يفكّ أي حزمة مرفوعة، ويُسطّح المتداخلة، ويتوقف برسالة واضحة إن لم يجد النواة ──
+          set -e
+          echo "┌─ تشخيص المستودع ────────────────────────────"
+          echo "│ repo:   ${GITHUB_REPOSITORY:-محلي}"
+          echo "│ branch: ${GITHUB_REF_NAME:-محلي}"
+          echo "│ pwd:    $(pwd)"
+          echo "└─────────────────────────────────────────────"
+          ls -la
+
+          found=""
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ ${#zips[@]} -gt 0 ]; then
+            for z in "${zips[@]}"; do
+              echo "📦 وجدت حزمة: $z — تُفكّ الآن"
+              rm -rf _pkg
+              unzip -o -q "$z" -d _pkg
+              # حزمة متداخلة (مثل payload/FieldwatchCore/...): نجد جذر المشروع ونُسطّحه
+              if [ ! -d FieldwatchCore ]; then
+                inner="$(find _pkg -maxdepth 4 -type d -name FieldwatchCore | head -1)"
+                if [ -n "$inner" ]; then
+                  root="$(dirname "$inner")"
+                  echo "↪ الحزمة متداخلة تحت: ${root#_pkg/} — تُسطَّح إلى الجذر"
+                  cp -a "$root"/. .
+                else
+                  cp -a _pkg/. .
+                fi
+              else
+                cp -a _pkg/. .
+              fi
+              rm -rf _pkg
+              found="$z"
+            done
+            rm -f "${zips[@]}"
+          else
+            echo "لا يوجد أي ملف .zip في جذر المستودع"
+          fi
+
+          echo "── المحتوى بعد التجهيز ──"
+          ls -la
+
+          if [ ! -d FieldwatchCore ] || [ ! -f FieldwatchCore/Package.swift ]; then
+            echo "::error title=الحزمة غير موجودة::لم أجد مجلد FieldwatchCore في جذر هذا المستودع."
+            echo ""
+            echo "════════════════════════════════════════════════════════"
+            echo " الحل: ارفع الملف fieldwatch-payload.zip إلى جذر هذا المستودع"
+            echo "      (نفس المستودع ${GITHUB_REPOSITORY:-هذا} الذي يعمل فيه هذا الـworkflow)"
+            echo " ثم أعد التشغيل. الحجم 581KB ويُفكّ تلقائيًا هنا."
+            echo "════════════════════════════════════════════════════════"
+            exit 1
+          fi
+          echo "✓ النواة جاهزة: FieldwatchCore/Package.swift"
+      - name: فحص الحزمة قبل البناء (PREFLIGHT)
+        run: |
+          if [ ! -f scripts/preflight.sh ]; then
+            echo "::error::scripts/preflight.sh غير موجود بعد فكّ الحزمة — الحزمة المرفوعة ناقصة أو قديمة جدًا."
+            exit 1
+          fi
+          bash scripts/preflight.sh
+      - name: البنية والمسارات
+        run: |
+          echo "مستودع: $GITHUB_REPOSITORY | فرع: $GITHUB_REF_NAME | بواسطة: $GITHUB_ACTOR"
+          ls -la
+          echo "── ملفات حرجة ──"
+          for p in project.yml FieldwatchCore/Package.swift FieldwatchApp/Sources/FieldwatchApp.swift \
+                   scripts/build-all.sh scripts/build-deb.sh entitlements/10-unsandbox.entitlements; do
+            if [ -e "$p" ]; then echo "✓ $p"; else echo "✗ ناقص: $p"; fi
+          done
+          echo "── Swift ──"; find . -name '*.swift' -not -path './.git/*' | sort
+          echo "── project.yml ──"; cat project.yml || true
+
+  tests:
+    name: اختبارات النواة (FieldwatchCore)
+    runs-on: macos-14
+    # صارم: فشل الاختبارات يمنع إنتاج أي IPA/DEB
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: بصمة الحزمة المطبَّقة (تحقق فوري من السجل)
+        run: |
+          if [ -f PAYLOAD-VERSION.txt ]; then
+            echo "══════ بصمة الحزمة ══════"
+            cat PAYLOAD-VERSION.txt
+            echo "═════════════════════════"
+          else
+            echo "⚠️⚠️ لا يوجد PAYLOAD-VERSION.txt في المستودع ⇒ الحزمة قديمة (قبل إصلاح count) ⚠️⚠️"
+            echo "    ارفع fieldwatch-payload.zip الجديدة إلى جذر هذا المستودع ثم شغّل من جديد."
+          fi
+          if [ -f FieldwatchApp/Sources/FieldwatchStore.swift ]; then
+            echo "— السطور 114-118 من SignatureCandidates.swift (يجب أن ترى: usable.filter { … }.count) —"
+            sed -n '114,118p' FieldwatchCore/Sources/FieldwatchCore/SignatureCandidates.swift 2>/dev/null || echo "(الملف غير موجود)"
+            echo "— بصمة إصلاحات طبقة التطبيق —"
+            grep -n "hits: \$0.hitCount" FieldwatchApp/Sources/FieldwatchStore.swift 2>/dev/null || echo "⚠️ FieldwatchStore.swift قديم (لا يزال فيه hitCount: الوسم الخاطئ)"
+            grep -n "struct BleRow" FieldwatchApp/Sources/BleScanner.swift 2>/dev/null || echo "⚠️ BleScanner.swift قديم (لا يزال يعرّف Sighting محليًا)"
+            grep -n "extension FieldwatchCore.Sighting: Identifiable" FieldwatchApp/Sources/FieldwatchStore.swift 2>/dev/null || echo "⚠️ ملحق Identifiable غير موجود"
+          else
+            echo "ℹ️ المصادر لم تُفكّ بعد (الحزمة مرفوعة كملف zip) — الفحص الكامل يجري في خطوة PREFLIGHT بعد تجهيز المستودع."
+          fi
+
+      - name: اختيار أحدث Xcode متاح (Swift 6+)
+        run: |
+          for x in /Applications/Xcode_18*.app /Applications/Xcode_17*.app /Applications/Xcode_16*.app /Applications/Xcode.app; do
+            if [ -d "$x" ]; then sudo xcode-select -s "$x" 2>/dev/null && echo "✓ Xcode: $x" && break; fi
+          done
+          echo "── الإصدارات ──"
+          xcodebuild -version 2>/dev/null || echo "(xcodebuild غير متاح)"
+          swift --version 2>/dev/null || echo "(swift غير متاح)"
+
+      - name: تجهيز المستودع — فكّ أي حزمة مرفوعة + تشخيص واضح
+        run: |
+          # ── تجهيز المستودع: يفكّ أي حزمة مرفوعة، ويُسطّح المتداخلة، ويتوقف برسالة واضحة إن لم يجد النواة ──
+          set -e
+          echo "┌─ تشخيص المستودع ────────────────────────────"
+          echo "│ repo:   ${GITHUB_REPOSITORY:-محلي}"
+          echo "│ branch: ${GITHUB_REF_NAME:-محلي}"
+          echo "│ pwd:    $(pwd)"
+          echo "└─────────────────────────────────────────────"
+          ls -la
+
+          found=""
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ ${#zips[@]} -gt 0 ]; then
+            for z in "${zips[@]}"; do
+              echo "📦 وجدت حزمة: $z — تُفكّ الآن"
+              rm -rf _pkg
+              unzip -o -q "$z" -d _pkg
+              # حزمة متداخلة (مثل payload/FieldwatchCore/...): نجد جذر المشروع ونُسطّحه
+              if [ ! -d FieldwatchCore ]; then
+                inner="$(find _pkg -maxdepth 4 -type d -name FieldwatchCore | head -1)"
+                if [ -n "$inner" ]; then
+                  root="$(dirname "$inner")"
+                  echo "↪ الحزمة متداخلة تحت: ${root#_pkg/} — تُسطَّح إلى الجذر"
+                  cp -a "$root"/. .
+                else
+                  cp -a _pkg/. .
+                fi
+              else
+                cp -a _pkg/. .
+              fi
+              rm -rf _pkg
+              found="$z"
+            done
+            rm -f "${zips[@]}"
+          else
+            echo "لا يوجد أي ملف .zip في جذر المستودع"
+          fi
+
+          echo "── المحتوى بعد التجهيز ──"
+          ls -la
+
+          if [ ! -d FieldwatchCore ] || [ ! -f FieldwatchCore/Package.swift ]; then
+            echo "::error title=الحزمة غير موجودة::لم أجد مجلد FieldwatchCore في جذر هذا المستودع."
+            echo ""
+            echo "════════════════════════════════════════════════════════"
+            echo " الحل: ارفع الملف fieldwatch-payload.zip إلى جذر هذا المستودع"
+            echo "      (نفس المستودع ${GITHUB_REPOSITORY:-هذا} الذي يعمل فيه هذا الـworkflow)"
+            echo " ثم أعد التشغيل. الحجم 581KB ويُفكّ تلقائيًا هنا."
+            echo "════════════════════════════════════════════════════════"
+            exit 1
+          fi
+          echo "✓ النواة جاهزة: FieldwatchCore/Package.swift"
+      - name: فحص الحزمة قبل البناء (PREFLIGHT)
+        run: |
+          if [ ! -f scripts/preflight.sh ]; then
+            echo "::error::scripts/preflight.sh غير موجود بعد فكّ الحزمة — الحزمة المرفوعة ناقصة أو قديمة جدًا."
+            exit 1
+          fi
+          bash scripts/preflight.sh
+      - name: Swift version
+        run: swift --version
+      - name: swift test
+        run: |
+          set -o pipefail
+          swift test --package-path FieldwatchCore 2>&1 | tee /tmp/fw-tests.log
+      - name: ارفع سجل الاختبارات
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-log
+          path: /tmp/fw-tests.log
+          if-no-files-found: warn
+
+  build:
+    name: بناء IPA + DEB
+    runs-on: macos-14
+    needs: [smoke, tests]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: بصمة الحزمة المطبَّقة (تحقق فوري من السجل)
+        run: |
+          if [ -f PAYLOAD-VERSION.txt ]; then
+            echo "══════ بصمة الحزمة ══════"
+            cat PAYLOAD-VERSION.txt
+            echo "═════════════════════════"
+          else
+            echo "⚠️⚠️ لا يوجد PAYLOAD-VERSION.txt في المستودع ⇒ الحزمة قديمة (قبل إصلاح count) ⚠️⚠️"
+            echo "    ارفع fieldwatch-payload.zip الجديدة إلى جذر هذا المستودع ثم شغّل من جديد."
+          fi
+          if [ -f FieldwatchApp/Sources/FieldwatchStore.swift ]; then
+            echo "— السطور 114-118 من SignatureCandidates.swift (يجب أن ترى: usable.filter { … }.count) —"
+            sed -n '114,118p' FieldwatchCore/Sources/FieldwatchCore/SignatureCandidates.swift 2>/dev/null || echo "(الملف غير موجود)"
+            echo "— بصمة إصلاحات طبقة التطبيق —"
+            grep -n "hits: \$0.hitCount" FieldwatchApp/Sources/FieldwatchStore.swift 2>/dev/null || echo "⚠️ FieldwatchStore.swift قديم (لا يزال فيه hitCount: الوسم الخاطئ)"
+            grep -n "struct BleRow" FieldwatchApp/Sources/BleScanner.swift 2>/dev/null || echo "⚠️ BleScanner.swift قديم (لا يزال يعرّف Sighting محليًا)"
+            grep -n "extension FieldwatchCore.Sighting: Identifiable" FieldwatchApp/Sources/FieldwatchStore.swift 2>/dev/null || echo "⚠️ ملحق Identifiable غير موجود"
+          else
+            echo "ℹ️ المصادر لم تُفكّ بعد (الحزمة مرفوعة كملف zip) — الفحص الكامل يجري في خطوة PREFLIGHT بعد تجهيز المستودع."
+          fi
+
+      - name: اختيار أحدث Xcode متاح (Swift 6+)
+        run: |
+          for x in /Applications/Xcode_18*.app /Applications/Xcode_17*.app /Applications/Xcode_16*.app /Applications/Xcode.app; do
+            if [ -d "$x" ]; then sudo xcode-select -s "$x" 2>/dev/null && echo "✓ Xcode: $x" && break; fi
+          done
+          echo "── الإصدارات ──"
+          xcodebuild -version 2>/dev/null || echo "(xcodebuild غير متاح)"
+          swift --version 2>/dev/null || echo "(swift غير متاح)"
+
+      - name: تجهيز المستودع — فكّ أي حزمة مرفوعة + تشخيص واضح
+        run: |
+          # ── تجهيز المستودع: يفكّ أي حزمة مرفوعة، ويُسطّح المتداخلة، ويتوقف برسالة واضحة إن لم يجد النواة ──
+          set -e
+          echo "┌─ تشخيص المستودع ────────────────────────────"
+          echo "│ repo:   ${GITHUB_REPOSITORY:-محلي}"
+          echo "│ branch: ${GITHUB_REF_NAME:-محلي}"
+          echo "│ pwd:    $(pwd)"
+          echo "└─────────────────────────────────────────────"
+          ls -la
+
+          found=""
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ ${#zips[@]} -gt 0 ]; then
+            for z in "${zips[@]}"; do
+              echo "📦 وجدت حزمة: $z — تُفكّ الآن"
+              rm -rf _pkg
+              unzip -o -q "$z" -d _pkg
+              # حزمة متداخلة (مثل payload/FieldwatchCore/...): نجد جذر المشروع ونُسطّحه
+              if [ ! -d FieldwatchCore ]; then
+                inner="$(find _pkg -maxdepth 4 -type d -name FieldwatchCore | head -1)"
+                if [ -n "$inner" ]; then
+                  root="$(dirname "$inner")"
+                  echo "↪ الحزمة متداخلة تحت: ${root#_pkg/} — تُسطَّح إلى الجذر"
+                  cp -a "$root"/. .
+                else
+                  cp -a _pkg/. .
+                fi
+              else
+                cp -a _pkg/. .
+              fi
+              rm -rf _pkg
+              found="$z"
+            done
+            rm -f "${zips[@]}"
+          else
+            echo "لا يوجد أي ملف .zip في جذر المستودع"
+          fi
+
+          echo "── المحتوى بعد التجهيز ──"
+          ls -la
+
+          if [ ! -d FieldwatchCore ] || [ ! -f FieldwatchCore/Package.swift ]; then
+            echo "::error title=الحزمة غير موجودة::لم أجد مجلد FieldwatchCore في جذر هذا المستودع."
+            echo ""
+            echo "════════════════════════════════════════════════════════"
+            echo " الحل: ارفع الملف fieldwatch-payload.zip إلى جذر هذا المستودع"
+            echo "      (نفس المستودع ${GITHUB_REPOSITORY:-هذا} الذي يعمل فيه هذا الـworkflow)"
+            echo " ثم أعد التشغيل. الحجم 581KB ويُفكّ تلقائيًا هنا."
+            echo "════════════════════════════════════════════════════════"
+            exit 1
+          fi
+          echo "✓ النواة جاهزة: FieldwatchCore/Package.swift"
+
+      - name: فحص الحزمة قبل البناء (PREFLIGHT)
+        run: |
+          if [ ! -f scripts/preflight.sh ]; then
+            echo "::error::scripts/preflight.sh غير موجود بعد فكّ الحزمة — الحزمة المرفوعة ناقصة أو قديمة جدًا."
+            exit 1
+          fi
+          bash scripts/preflight.sh
+      - name: تشخيص
+        run: |
+          ls -la
+          cat project.yml || true
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: أدوات البناء
+        run: |
+          brew install xcodegen
+          brew install dpkg || true      # يوفّر dpkg-deb لبناء حزم deb
+          brew install ldid || true      # لتثبيت الصلاحيات في توقيع التنفيذي
+
+      - name: بناء الكل (IPA عادي + TrollStore IPA + DEB rootless + DEB rootful)
+        run: |
+          set -o pipefail
+          bash scripts/build-all.sh 2>&1 | tee /tmp/fw-build.log
+
+      - name: ارفع الـ IPA (بلا صلاحيات)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fieldwatch-unsigned-ipa
+          path: out/Fieldwatch-unsigned.ipa
+          if-no-files-found: warn
+
+      - name: ارفع الـ IPA (بصلاحيات — TrollStore)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fieldwatch-trollstore-ipa
+          path: out/Fieldwatch-trollstore.ipa
+          if-no-files-found: warn
+
+      - name: ارفع حزمة DEB (rootless)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fieldwatch-deb-rootless
+          path: out/*-rootless.deb
+          if-no-files-found: warn
+
+      - name: ارفع حزمة DEB (rootful)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fieldwatch-deb-rootful
+          path: out/*-rootful.deb
+          if-no-files-found: warn
+
+      - name: ارفع سجل البناء + محتوى الحزم (عند أي فشل)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-and-info
+          path: |
+            /tmp/fw-build.log
+            out/*.deb
+          if-no-files-found: warn
+
+      - name: ملخص في صفحة التشغيل
+        if: always()
+        run: |
+          {
+            echo "## الناتج"
+            ls -lh out/ 2>/dev/null || echo "لا مجلد out/"
+            echo
+            echo "### أي ملف تختار؟"
+            echo "| الملف | متى تستعمله |"
+            echo "|---|---|"
+            echo "| Fieldwatch-deb-rootless.deb | jailbreak حديث (Dopamine/palera1n rootless) — الخيار الأول |"
+            echo "| Fieldwatch-deb-rootful.deb | jailbreak قديم (checkra1n) |"
+            echo "| Fieldwatch-trollstore.ipa | TrollStore/AppSync (تثبيت بنقرة) |"
+            echo "| Fieldwatch-unsigned.ipa | تثبيت عادي بلا صلاحيات خاصة |"
+          } >> "$GITHUB_STEP_SUMMARY"
